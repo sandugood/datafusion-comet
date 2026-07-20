@@ -781,7 +781,7 @@ abstract class CometNativeExec extends CometExec {
    *   (commonByKey, perPartitionByKey) - common data is shared, per-partition varies
    */
   private def findAllPlanData(
-      plan: SparkPlan): (Map[String, Array[Byte]], Map[String, Array[Array[Byte]]]) = {
+      plan: SparkPlan): (Map[String, Array[Array[Byte]]], Map[String, Array[Array[Byte]]]) = {
     plan match {
       case iceberg: CometIcebergNativeScanExec =>
         // Trigger Spark's standard prepare -> waitForSubqueries lifecycle so DPP
@@ -801,7 +801,7 @@ abstract class CometNativeExec extends CometExec {
       case nativeScan: CometNativeScanExec =>
         nativeScan.ensureSubqueriesResolved()
         (
-          Map(nativeScan.sourceKey -> nativeScan.commonData),
+          Map(nativeScan.sourceKey -> Array(nativeScan.commonData)),
           Map(nativeScan.sourceKey -> nativeScan.perPartitionData))
 
       // Broadcast stages are boundaries - don't collect per-partition data from inside them.

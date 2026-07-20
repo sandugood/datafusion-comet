@@ -199,7 +199,7 @@ private[comet] object PlanDataInjector extends Logging {
    *   (commonByKey, perPartitionByKey) - common data is shared, per-partition varies
    */
   private[comet] def findAllPlanData(
-      plan: SparkPlan): (Map[String, Array[Byte]], Map[String, Array[Array[Byte]]]) = {
+      plan: SparkPlan): (Map[String, Array[Array[Byte]]], Map[String, Array[Array[Byte]]]) = {
     plan match {
       case iceberg: CometIcebergNativeScanExec =>
         // Trigger Spark's standard prepare -> waitForSubqueries lifecycle so DPP
@@ -226,7 +226,7 @@ private[comet] object PlanDataInjector extends Logging {
       case s: CometLeafExec with CometScanWithPlanData =>
         s.ensureSubqueriesResolved()
         if (s.commonData.nonEmpty && s.perPartitionData.nonEmpty) {
-          (Map(s.sourceKey -> s.commonData), Map(s.sourceKey -> s.perPartitionData))
+          (Map(s.sourceKey -> Array(s.commonData)), Map(s.sourceKey -> s.perPartitionData))
         } else {
           (Map.empty, Map.empty)
         }
@@ -885,66 +885,6 @@ abstract class CometNativeExec extends CometExec {
   }
 
   /**
-<<<<<<< HEAD
-   * Find all plan nodes with per-partition planning data in the plan tree. Returns two maps keyed
-   * by a unique identifier: one for common data (shared across partitions) and one for
-   * per-partition data.
-   *
-   * Currently supports Iceberg scans (keyed by metadata_location). Additional scan types can be
-   * added by extending this method.
-   *
-   * Stops at stage boundaries (shuffle exchanges, etc.) because partition indices are only valid
-   * within the same stage.
-   *
-   * @return
-   *   (commonByKey, perPartitionByKey) - common data is shared, per-partition varies
-   */
-  private def findAllPlanData(
-      plan: SparkPlan): (Map[String, Array[Array[Byte]]], Map[String, Array[Array[Byte]]]) = {
-    plan match {
-      case iceberg: CometIcebergNativeScanExec =>
-        // Trigger Spark's standard prepare -> waitForSubqueries lifecycle so DPP
-        // InSubqueryExec values are resolved before commonData is read. Without this,
-        // the parent CometNativeExec.executeQuery flow never invokes the scan's
-        // executeQuery, leaving DPP unresolved and forcing a sync-on-this await inside
-        // the serializedPartitionData lazy val initializer (a known deadlock surface).
-        iceberg.ensureSubqueriesResolved()
-        if (iceberg.commonData.nonEmpty && iceberg.perPartitionData.nonEmpty) {
-          (
-            Map(iceberg.metadataLocation -> iceberg.commonData),
-            Map(iceberg.metadataLocation -> iceberg.perPartitionData))
-        } else {
-          (Map.empty, Map.empty)
-        }
-
-      case nativeScan: CometNativeScanExec =>
-        nativeScan.ensureSubqueriesResolved()
-        (
-          Map(nativeScan.sourceKey -> Array(nativeScan.commonData)),
-          Map(nativeScan.sourceKey -> nativeScan.perPartitionData))
-
-      // Broadcast stages are boundaries - don't collect per-partition data from inside them.
-      // After DPP filtering, broadcast scans may have different partition counts than the
-      // probe side, causing ArrayIndexOutOfBoundsException in CometExecRDD.getPartitions.
-      case _: BroadcastQueryStageExec | _: CometBroadcastExchangeExec =>
-        (Map.empty, Map.empty)
-
-      // Stage boundaries - stop searching (partition indices won't align after these)
-      case _: ShuffleQueryStageExec | _: AQEShuffleReadExec | _: CometShuffleExchangeExec |
-          _: CometUnionExec | _: CometTakeOrderedAndProjectExec | _: CometCoalesceExec |
-          _: ReusedExchangeExec | _: CometSparkToColumnarExec =>
-        (Map.empty, Map.empty)
-
-      // Continue searching through other operators, combining results from all children
-      case _ =>
-        val results = plan.children.map(findAllPlanData)
-        (results.flatMap(_._1).toMap, results.flatMap(_._2).toMap)
-    }
-  }
-
-  /**
-=======
->>>>>>> upstream/main
    * Converts this native Comet operator and its children into a native block which can be
    * executed as a whole (i.e., in a single JNI call) from the native side.
    */

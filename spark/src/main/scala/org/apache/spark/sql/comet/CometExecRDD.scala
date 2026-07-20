@@ -189,10 +189,7 @@ object CometExecRDD {
    * library is loaded lazily on first use (idempotent; `CometExecIterator` may have loaded it
    * already).
    */
-  private lazy val nativeLib: Native = {
-    org.apache.comet.NativeBase.load()
-    new Native()
-  }
+  private lazy val nativeLib: Native = new Native()
 
   /**
    * Resolve the per-partition native input slots for `createPlan`, in scan-input order. A slot is

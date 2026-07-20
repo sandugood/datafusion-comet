@@ -98,6 +98,7 @@ use crate::execution::memory_pools::{
     create_memory_pool, handle_task_shared_pool_release, parse_memory_pool_config, MemoryPoolConfig,
 };
 use crate::execution::operators::{ScanExec, ShuffleScanExec};
+use crate::execution::iceberg_common_cache;
 use crate::execution::shuffle::{read_ipc_compressed, CompressionCodec};
 use crate::execution::spark_plan::SparkPlan;
 
@@ -1171,6 +1172,53 @@ pub extern "system" fn Java_org_apache_comet_Native_getRustThreadId(
     _class: JClass,
 ) -> jlong {
     get_thread_id() as jlong
+}
+
+#[no_mangle]
+/// Registers out-of-band Iceberg scan common data (sharded IcebergScanCommon chunks) with the
+/// per-executor native cache, keyed by the table metadata_location. See
+/// `crate::execution::iceberg_common_cache` and issue #4944.
+///
+/// # Safety
+/// This function is inherently unsafe since it deals with raw pointers passed from JNI.
+pub unsafe extern "system" fn Java_org_apache_comet_Native_registerIcebergCommon(
+    e: EnvUnowned,
+    _class: JClass,
+    key: JString,
+    chunks: JObjectArray,
+) {
+    try_unwrap_or_throw(&e, |env| {
+        let key: String = key.try_to_string(env)?;
+
+        let num_chunks = chunks.len(env)?;
+        let mut chunk_bytes: Vec<Vec<u8>> = Vec::with_capacity(num_chunks as usize);
+        for i in 0..num_chunks {
+            let inner = chunks.get_element(env, i)?;
+            let inner = unsafe { JByteArray::from_raw(&*env, inner.into_raw()) };
+            chunk_bytes.push(env.convert_byte_array(inner)?);
+        }
+
+        iceberg_common_cache::register(&key, &chunk_bytes)?;
+        Ok(())
+    })
+}
+
+#[no_mangle]
+/// Drops previously-registered Iceberg common data for `key` from the native cache (no-op if
+/// absent).
+///
+/// # Safety
+/// This function is inherently unsafe since it deals with raw pointers passed from JNI.
+pub unsafe extern "system" fn Java_org_apache_comet_Native_deregisterIcebergCommon(
+    e: EnvUnowned,
+    _class: JClass,
+    key: JString,
+) {
+    try_unwrap_or_throw(&e, |env| {
+        let key: String = key.try_to_string(env)?;
+        iceberg_common_cache::deregister(&key);
+        Ok(())
+    })
 }
 
 // ============================================================================

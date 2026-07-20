@@ -251,7 +251,9 @@ case class CometNativeScanExec(
     new CometExecRDD(
       sparkContext,
       Seq.empty,
-      Map(sourceKey -> commonData),
+      // Native (Parquet) scans are never sharded; wrap the single common blob as a one-element
+      // chunk list to match CometExecRDD's now chunk-aware commonByKey (see issue #4944).
+      Map(sourceKey -> Array(commonData)),
       Map(sourceKey -> perPartitionData),
       serializedPlan,
       perPartitionData.length,

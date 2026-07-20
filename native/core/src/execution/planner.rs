@@ -24,6 +24,7 @@ pub mod operator_registry;
 use crate::execution::operators::init_csv_datasource_exec;
 use crate::execution::operators::AlignedArrowStreamReader;
 use crate::execution::operators::IcebergScanExec;
+use crate::execution::iceberg_common_cache;
 use crate::execution::{
     expressions::list_positions::ListPositionsExpr,
     expressions::subquery::Subquery,
@@ -1559,12 +1560,39 @@ impl PhysicalPlanner {
                 ))
             }
             OpStruct::IcebergScan(scan) => {
-                // Extract common data and single partition's file tasks
-                // Per-partition injection happens in Scala before sending to native
-                let common = scan
-                    .common
-                    .as_ref()
-                    .ok_or_else(|| GeneralError("IcebergScan missing common data".into()))?;
+                // Extract common data and single partition's file tasks.
+                // Per-partition injection happens in Scala before sending to native.
+                //
+                // Common data arrives one of two ways (see IcebergScan.common_ref in operator.proto
+                // and issue #4944):
+                //   - Inline: `scan.common` is set. Small scans; unchanged path.
+                //   - Out-of-band: `scan.common` is unset and `scan.common_ref` names a table whose
+                //     sharded common was registered per-executor via registerIcebergCommon. Large
+                //     scans whose pools would overflow a single protobuf message use this path.
+                // `owned_common` keeps the Arc alive when resolved from the cache; `common` borrows
+                // from whichever source so the rest of the arm is identical for both paths.
+                let owned_common;
+                let common: &spark_operator::IcebergScanCommon = match scan.common.as_ref() {
+                    Some(inline) => inline,
+                    None => {
+                        let key = scan.common_ref.as_str();
+                        if key.is_empty() {
+                            return Err(GeneralError(
+                                "IcebergScan has neither inline common nor common_ref".into(),
+                            ));
+                        }
+                        owned_common = iceberg_common_cache::get(key).ok_or_else(|| {
+                            // A miss means the JVM believed this key was registered but the native
+                            // cache evicted it. Surface a clear, retryable error; the JVM guard in
+                            // CometExecRDD re-registers on the next task attempt.
+                            GeneralError(format!(
+                                "Registered Iceberg common for '{key}' not found in native cache \
+                                 (likely evicted); the task will re-register and retry"
+                            ))
+                        })?;
+                        owned_common.as_ref()
+                    }
+                };
 
                 let required_schema =
                     convert_spark_types_to_arrow_schema(common.required_schema.as_slice());

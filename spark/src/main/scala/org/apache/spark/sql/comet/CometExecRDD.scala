@@ -28,7 +28,7 @@ import org.apache.spark.sql.execution.ScalarSubquery
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.SerializableConfiguration
 
-import org.apache.comet.{CometExecIterator, CometRuntimeException, CometShuffleBlockIterator}
+import org.apache.comet.{CometExecIterator, CometRuntimeException, CometShuffleBlockIterator, Native}
 import org.apache.comet.serde.OperatorOuterClass
 
 /**
@@ -56,7 +56,7 @@ private[spark] class CometExecPartition(
 private[spark] class CometExecRDD(
     sc: SparkContext,
     var inputRDDs: Seq[RDD[_]],
-    commonByKey: Map[String, Array[Byte]],
+    commonByKey: Map[String, Array[Array[Byte]]],
     @transient perPartitionByKey: Map[String, Array[Array[Byte]]],
     serializedPlan: Array[Byte],
     defaultNumPartitions: Int,
@@ -102,6 +102,16 @@ private[spark] class CometExecRDD(
         partition.inputPartitions,
         shuffleScanIndices,
         context)
+
+    // Register any out-of-band (multi-chunk) Iceberg common data with the native side exactly
+    // once per executor process per key, before the plan that references it is created. Chunks
+    // are each bounded well under 2 GiB; the native side merges them into one cached structure
+    // (issue #4944). Single-chunk commons stay on the inline injection path and are not registered.
+    commonByKey.foreach { case (key, chunks) =>
+      if (chunks.length > 1 && CometExecRDD.markCommonRegisteredIfFirst(key)) {
+        CometExecRDD.nativeLib.registerIcebergCommon(key, chunks)
+      }
+    }
 
     // Only inject if we have per-partition planning data
     val actualPlan = if (commonByKey.nonEmpty) {
@@ -157,6 +167,34 @@ private[spark] class CometExecRDD(
 object CometExecRDD {
 
   /**
+   * Per-executor-process set of Iceberg common keys already registered with the native side, so
+   * multi-chunk common data is shipped across the JNI boundary once per executor rather than once
+   * per task. See [[CometExecRDD.compute]] and Native.registerIcebergCommon (issue #4944).
+   */
+  private val registeredCommonKeys: java.util.Set[String] =
+    java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
+
+  /** @return true iff this call was the first to claim `key` (caller should register it). */
+  private[comet] def markCommonRegisteredIfFirst(key: String): Boolean =
+    registeredCommonKeys.add(key)
+
+  /** Test/lifecycle hook: forget a registered key so a later task re-registers it. */
+  private[comet] def forgetRegisteredCommon(key: String): Unit = {
+    registeredCommonKeys.remove(key)
+    CometExecRDD.nativeLib.deregisterIcebergCommon(key)
+  }
+
+  /**
+   * Executor-local native handle used only for the register/deregister side channel. The native
+   * library is loaded lazily on first use (idempotent; `CometExecIterator` may have loaded it
+   * already).
+   */
+  private lazy val nativeLib: Native = {
+    org.apache.comet.NativeBase.load()
+    new Native()
+  }
+
+  /**
    * Resolve the per-partition native input slots for `createPlan`, in scan-input order. A slot is
    * either a `CometShuffleBlockIterator` (for slots in `shuffleScanIndices`, fed by a
    * `CometShuffledBatchRDD` consumed via the JNI block-iteration protocol) or the single
@@ -205,7 +243,7 @@ object CometExecRDD {
   def apply(
       sc: SparkContext,
       inputRDDs: Seq[RDD[_]],
-      commonByKey: Map[String, Array[Byte]],
+      commonByKey: Map[String, Array[Array[Byte]]],
       perPartitionByKey: Map[String, Array[Array[Byte]]],
       serializedPlan: Array[Byte],
       numPartitions: Int,

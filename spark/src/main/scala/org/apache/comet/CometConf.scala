@@ -132,6 +132,25 @@ object CometConf extends ShimCometConf {
       .checkValue(v => v > 0, "Data file concurrency limit must be positive")
       .createWithDefault(1)
 
+  val COMET_ICEBERG_COMMON_CHUNK_MAX_BYTES: ConfigEntry[Long] =
+    conf("spark.comet.scan.icebergNative.commonChunkMaxBytes")
+      .category(CATEGORY_SCAN)
+      .doc(
+        "Maximum serialized size, in bytes, of a single Iceberg scan common-data chunk. " +
+          "The deduplication pools shared across a scan's partitions (schemas, partition specs, " +
+          "delete-file lists, etc.) are sharded into chunks no larger than this so that no " +
+          "single protobuf message or JVM byte array approaches protobuf's hard 2 GiB limit " +
+          "(a scan over a large MOR table with many distinct positional-delete combinations can " +
+          "otherwise overflow it and throw NegativeArraySizeException). When the pools fit in a " +
+          "single chunk under this size they are embedded inline exactly as before; only larger " +
+          "scans use the out-of-band, per-executor-registered delivery path. Must be well under " +
+          "2 GiB; the default of 512 MiB leaves ample headroom.")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(
+        v => v > 0 && v <= (1L << 30),
+        "Common chunk max bytes must be positive and at most 1 GiB")
+      .createWithDefault(512L * 1024 * 1024)
+
   val COMET_CSV_V2_NATIVE_ENABLED: ConfigEntry[Boolean] =
     conf("spark.comet.scan.csv.v2.enabled")
       .category(CATEGORY_TESTING)

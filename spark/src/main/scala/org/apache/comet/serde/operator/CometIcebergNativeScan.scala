@@ -727,12 +727,18 @@ object CometIcebergNativeScan extends CometOperatorSerde[CometBatchScanExec] wit
    * @param metadata
    *   Pre-extracted Iceberg metadata from CometScanRule
    * @return
-   *   Tuple of (commonBytes, perPartitionBytes) for native execution
+   *   Tuple of (commonChunks, perPartitionBytes) for native execution. `commonChunks` holds one
+   *   or more serialized [[OperatorOuterClass.IcebergScanCommon]] messages: a single element when
+   *   the pools fit under [[CometConf.COMET_ICEBERG_COMMON_CHUNK_MAX_BYTES]] (the inline path,
+   *   behaviourally identical to before), or several when they don't (the out-of-band path, which
+   *   avoids protobuf's 2 GiB single-message ceiling -- see issue #4944). Callers concatenate the
+   *   chunks' pools in order to reconstruct the flat pool index space referenced by each task's
+   *   `*_idx` fields.
    */
   def serializePartitions(
       scanExec: BatchScanExec,
       output: Seq[Attribute],
-      metadata: CometIcebergNativeScanMetadata): (Array[Byte], Array[Array[Byte]]) = {
+      metadata: CometIcebergNativeScanMetadata): (Array[Array[Byte]], Array[Array[Byte]]) = {
 
     val commonBuilder = OperatorOuterClass.IcebergScanCommon.newBuilder()
 
@@ -1023,10 +1029,124 @@ object CometIcebergNativeScan extends CometOperatorSerde[CometBatchScanExec] wit
           s"$partitionDataPoolBytes bytes (protobuf)")
     }
 
-    val commonBytes = commonBuilder.build().toByteArray
+    // Shard the accumulated common pools into chunks each well under protobuf's 2 GiB
+    // single-message ceiling. `build()` only assembles in-memory Java objects (bounded by heap,
+    // not by int), so it is always safe; the overflow historically occurred one line later, when
+    // a single `.toByteArray` allocated `new byte[getSerializedSize()]` and getSerializedSize()
+    // wrapped negative for pools exceeding Integer.MAX_VALUE bytes (issue #4944). Sharding keeps
+    // every serialized message and every allocated array bounded by chunkMaxBytes.
+    val chunkMaxBytes = CometConf.COMET_ICEBERG_COMMON_CHUNK_MAX_BYTES.get()
+    val commonChunks = shardCommon(commonBuilder.build(), chunkMaxBytes)
     val perPartitionBytes = perPartitionBuilders.map(_.toByteArray).toArray
 
-    (commonBytes, perPartitionBytes)
+    if (commonChunks.length > 1) {
+      logInfo(
+        s"IcebergScan common data sharded into ${commonChunks.length} chunks " +
+          s"(chunkMaxBytes=$chunkMaxBytes); using out-of-band per-executor delivery.")
+    }
+
+    (commonChunks, perPartitionBytes)
+  }
+
+  /**
+   * Splits a fully-built [[OperatorOuterClass.IcebergScanCommon]] into one or more serialized
+   * chunks, each with a serialized size at or below `chunkMaxBytes` (except when a single
+   * indivisible pool entry is itself larger than the limit, which is preserved whole).
+   *
+   * The scalar header fields (metadata_location, required schema, catalog properties, concurrency
+   * limit, catalog name) live only on the first chunk. Every repeated dedup pool is packed
+   * greedily, in original order, across chunks. Because each pool is concatenated independently
+   * and in chunk order on the receiving side, the flat pool index space referenced by each task's
+   * `schema_idx` / `delete_files_idx` / etc. is preserved: pool entry N still resolves to the Nth
+   * entry of that pool after all chunks are merged.
+   *
+   * Never calls `getSerializedSize` on the whole message (that is the operation that overflows for
+   * the pathological input); it only ever measures individual pool entries, each of which is small.
+   */
+  private def shardCommon(
+      common: OperatorOuterClass.IcebergScanCommon,
+      chunkMaxBytes: Long): Array[Array[Byte]] = {
+
+    val chunks = mutable.ArrayBuffer[OperatorOuterClass.IcebergScanCommon.Builder]()
+
+    // First chunk carries the scalar header. Subsequent chunks (if any) carry only pool overflow.
+    val header = OperatorOuterClass.IcebergScanCommon.newBuilder()
+    header.setMetadataLocation(common.getMetadataLocation)
+    header.setDataFileConcurrencyLimit(common.getDataFileConcurrencyLimit)
+    header.setCatalogName(common.getCatalogName)
+    header.putAllCatalogProperties(common.getCatalogPropertiesMap)
+    header.addAllRequiredSchema(common.getRequiredSchemaList)
+    chunks += header
+
+    // Estimate the header's contribution as a Long so a huge required schema can't wrap an int.
+    var currentBytes: Long = estimateHeaderBytes(common)
+
+    // A few bytes of tag + length-delimiter overhead per repeated entry. Slightly generous so the
+    // greedy packer stays conservatively under the ceiling.
+    val perEntryOverhead = 8L
+
+    // Roll to a fresh (header-less) chunk if adding `entryBytes` would exceed the limit and the
+    // current chunk already holds something. Returns the builder that should receive the entry.
+    def target(entryBytes: Long): OperatorOuterClass.IcebergScanCommon.Builder = {
+      val cur = chunks.last
+      val curHasContent = currentBytes > 0
+      if (curHasContent && currentBytes + entryBytes > chunkMaxBytes) {
+        val fresh = OperatorOuterClass.IcebergScanCommon.newBuilder()
+        chunks += fresh
+        currentBytes = 0L
+        fresh
+      } else {
+        cur
+      }
+    }
+
+    // Pack one repeated pool. `sizeOf` measures a single entry; `add` appends it to a chunk.
+    def packPool[T](entries: java.util.List[T], sizeOf: T => Int)(
+        add: (OperatorOuterClass.IcebergScanCommon.Builder, T) => Unit): Unit = {
+      entries.asScala.foreach { entry =>
+        val entryBytes = sizeOf(entry).toLong + perEntryOverhead
+        val b = target(entryBytes)
+        add(b, entry)
+        currentBytes += entryBytes
+      }
+    }
+
+    // string pools -- size is UTF-8 byte length (upper-bounded by 3*chars, but getBytes is exact).
+    def strBytes(s: String): Int = s.getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+
+    packPool[String](common.getSchemaPoolList, strBytes)((b, e) => b.addSchemaPool(e))
+    packPool[String](common.getPartitionTypePoolList, strBytes)((b, e) => b.addPartitionTypePool(e))
+    packPool[String](common.getPartitionSpecPoolList, strBytes)((b, e) => b.addPartitionSpecPool(e))
+    packPool[String](common.getNameMappingPoolList, strBytes)((b, e) => b.addNameMappingPool(e))
+    packPool[OperatorOuterClass.ProjectFieldIdList](
+      common.getProjectFieldIdsPoolList,
+      _.getSerializedSize)((b, e) => b.addProjectFieldIdsPool(e))
+    packPool[OperatorOuterClass.PartitionData](
+      common.getPartitionDataPoolList,
+      _.getSerializedSize)((b, e) => b.addPartitionDataPool(e))
+    packPool[OperatorOuterClass.DeleteFileList](
+      common.getDeleteFilesPoolList,
+      _.getSerializedSize)((b, e) => b.addDeleteFilesPool(e))
+    packPool[org.apache.comet.serde.ExprOuterClass.Expr](
+      common.getResidualPoolList,
+      _.getSerializedSize)((b, e) => b.addResidualPool(e))
+
+    chunks.map(_.build().toByteArray).toArray
+  }
+
+  /** Long-valued estimate of the scalar header's serialized size (never overflows an int). */
+  private def estimateHeaderBytes(common: OperatorOuterClass.IcebergScanCommon): Long = {
+    var bytes = 0L
+    bytes += common.getMetadataLocation
+      .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      .length
+      .toLong
+    bytes += common.getCatalogName.getBytes(java.nio.charset.StandardCharsets.UTF_8).length.toLong
+    common.getCatalogPropertiesMap.asScala.foreach { case (k, v) =>
+      bytes += k.length.toLong + v.length.toLong + 8L
+    }
+    common.getRequiredSchemaList.asScala.foreach(f => bytes += f.getSerializedSize.toLong + 4L)
+    bytes + 16L // concurrency limit + framing slack
   }
 
   override def createExec(nativeOp: Operator, op: CometBatchScanExec): CometNativeExec = {

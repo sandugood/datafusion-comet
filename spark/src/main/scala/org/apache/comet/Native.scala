@@ -74,6 +74,32 @@ class Native extends NativeBase {
   // scalastyle:on
 
   /**
+   * Registers out-of-band Iceberg scan common data (deduplication pools, schemas, catalog props)
+   * with the native side, keyed by the table's metadata_location. Used only for scans large enough
+   * that the pools cannot fit in a single protobuf message (issue #4944); such scans reference this
+   * registered data via `IcebergScan.common_ref` instead of embedding it.
+   *
+   * `chunks` is the sharded [[org.apache.comet.serde.OperatorOuterClass.IcebergScanCommon]], each
+   * element an independently-serialized message well under protobuf's 2 GiB ceiling. The native
+   * side merges the chunks' pools in order into one cached structure. Registration is idempotent
+   * per key within an executor process and must happen before `createPlan` for any plan that
+   * references the key. Callers (see CometExecRDD) guarantee once-per-executor delivery.
+   *
+   * @param key
+   *   the table metadata_location, matching `IcebergScan.common_ref`
+   * @param chunks
+   *   the sharded common messages, in pool-index order
+   */
+  @native def registerIcebergCommon(key: String, chunks: Array[Array[Byte]]): Unit
+
+  /**
+   * Drops previously-registered Iceberg common data for `key` from the native cache. Safe to call
+   * for an unknown key (no-op). Intended for lifecycle/test teardown; steady-state execution relies
+   * on the native cache's own bounded eviction.
+   */
+  @native def deregisterIcebergCommon(key: String): Unit
+
+  /**
    * Execute a native query plan based on given input Arrow arrays.
    *
    * @param stage

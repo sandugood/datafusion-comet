@@ -74,8 +74,14 @@ private[comet] trait PlanDataInjector {
   /** Extract the key used to look up planning data for this operator. */
   def getKey(op: Operator): Option[String]
 
-  /** Inject common + partition data into the operator node. */
-  def inject(op: Operator, commonBytes: Array[Byte], partitionBytes: Array[Byte]): Operator
+  /**
+   * Inject common + partition data into the operator node.
+   *
+   * `commonChunks` is a chunk list: a single element for the ordinary inline case, or several when
+   * an Iceberg scan's dedup pools were sharded to stay under protobuf's 2 GiB message ceiling
+   * (issue #4944). Injectors that never shard (e.g. native Parquet scan) require exactly one chunk.
+   */
+  def inject(op: Operator, commonChunks: Array[Array[Byte]], partitionBytes: Array[Byte]): Operator
 }
 
 /**
@@ -99,7 +105,7 @@ private[comet] object PlanDataInjector {
    */
   def injectPlanData(
       op: Operator,
-      commonByKey: Map[String, Array[Byte]],
+      commonByKey: Map[String, Array[Array[Byte]]],
       partitionByKey: Map[String, Array[Byte]]): Operator = {
     val builder = op.toBuilder
 
@@ -153,6 +159,11 @@ private[comet] object IcebergPlanDataInjector extends PlanDataInjector {
   // IcebergPlanDataInjector is a singleton, so we use an LRU cache to eventually evict old
   // IcebergScanCommon objects. 16 seems like a reasonable starting point since these objects
   // are not large. Thread-safe LinkedHashMap with accessOrder=true provides LRU ordering.
+  //
+  // Only the inline (single-chunk) path populates this cache. Multi-chunk (out-of-band) commons
+  // are never parsed or merged on the JVM side -- they are registered with, merged by, and cached
+  // on the native side (see Native.registerIcebergCommon), so the JVM never has to hold or
+  // reserialize a >2 GiB IcebergScanCommon (issue #4944).
   private val commonCache = java.util.Collections.synchronizedMap(
     new LinkedHashMap[ByteBuffer, OperatorOuterClass.IcebergScanCommon](4, 0.75f, true) {
       override def removeEldestEntry(
@@ -164,33 +175,50 @@ private[comet] object IcebergPlanDataInjector extends PlanDataInjector {
   override def canInject(op: Operator): Boolean =
     op.hasIcebergScan &&
       op.getIcebergScan.getFileScanTasksCount == 0 &&
-      op.getIcebergScan.hasCommon
+      // Inject when the operator still needs its per-task tasks/common filled in. This is true
+      // both for the inline (hasCommon) and the placeholder pre-injection state.
+      (op.getIcebergScan.hasCommon || op.getIcebergScan.getCommonRef.isEmpty)
 
   override def getKey(op: Operator): Option[String] =
     Some(op.getIcebergScan.getCommon.getMetadataLocation)
 
   override def inject(
       op: Operator,
-      commonBytes: Array[Byte],
+      commonChunks: Array[Array[Byte]],
       partitionBytes: Array[Byte]): Operator = {
     val scan = op.getIcebergScan
+    val tasksOnly = OperatorOuterClass.IcebergScan.parseFrom(partitionBytes)
+    val scanBuilder = scan.toBuilder
 
-    // Cache the parsed common data to avoid deserializing on every partition
-    val cacheKey = ByteBuffer.wrap(commonBytes)
-    val common = commonCache.synchronized {
-      Option(commonCache.get(cacheKey)).getOrElse {
-        val parsed = OperatorOuterClass.IcebergScanCommon.parseFrom(commonBytes)
-        commonCache.put(cacheKey, parsed)
-        parsed
+    if (commonChunks.length == 1) {
+      // Inline path (unchanged behaviour): parse and embed the single common message.
+      val commonBytes = commonChunks(0)
+      val cacheKey = ByteBuffer.wrap(commonBytes)
+      val common = commonCache.synchronized {
+        Option(commonCache.get(cacheKey)).getOrElse {
+          val parsed = OperatorOuterClass.IcebergScanCommon.parseFrom(commonBytes)
+          commonCache.put(cacheKey, parsed)
+          parsed
+        }
       }
+      scanBuilder.setCommon(common)
+      scanBuilder.clearCommonRef()
+    } else {
+      // Out-of-band path: the merged common lives in the per-executor native cache, keyed by
+      // metadata_location. The operator carries only a reference; the pools are NOT embedded here,
+      // so this operator's serialized size stays bounded regardless of total pool size. The
+      // metadata_location is read from the (small) common header carried on the pre-injection
+      // operator, which the serializer leaves populated on `scan.getCommon` for exactly this
+      // lookup even in out-of-band mode.
+      val ref = scan.getCommon.getMetadataLocation
+      require(
+        ref.nonEmpty,
+        "Out-of-band Iceberg common has no metadata_location to use as common_ref")
+      scanBuilder.clearCommon()
+      scanBuilder.setCommonRef(ref)
     }
 
-    val tasksOnly = OperatorOuterClass.IcebergScan.parseFrom(partitionBytes)
-
-    val scanBuilder = scan.toBuilder
-    scanBuilder.setCommon(common)
     scanBuilder.addAllFileScanTasks(tasksOnly.getFileScanTasksList)
-
     op.toBuilder.setIcebergScan(scanBuilder).build()
   }
 }
@@ -220,10 +248,14 @@ private[comet] object NativeScanPlanDataInjector extends PlanDataInjector {
 
   override def inject(
       op: Operator,
-      commonBytes: Array[Byte],
+      commonChunks: Array[Array[Byte]],
       partitionBytes: Array[Byte]): Operator = {
 
-    val common = OperatorOuterClass.NativeScanCommon.parseFrom(commonBytes)
+    // Native (Parquet) scans are never sharded, so exactly one chunk is expected.
+    require(
+      commonChunks.length == 1,
+      s"NativeScanPlanDataInjector expects a single common chunk, got ${commonChunks.length}")
+    val common = OperatorOuterClass.NativeScanCommon.parseFrom(commonChunks(0))
     val partitionOnly = OperatorOuterClass.NativeScan.parseFrom(partitionBytes)
 
     // Build complete NativeScan with common fields + this partition's file list
@@ -396,7 +428,7 @@ private[comet] case class NativeExecContext(
     subqueries: Seq[ScalarSubquery],
     broadcastedHadoopConfForEncryption: Option[Broadcast[SerializableConfiguration]],
     encryptedFilePaths: Seq[String],
-    commonByKey: Map[String, Array[Byte]],
+    commonByKey: Map[String, Array[Array[Byte]]],
     perPartitionByKey: Map[String, Array[Array[Byte]]],
     shuffleScanIndices: Set[Int],
     hasScanInput: Boolean) {

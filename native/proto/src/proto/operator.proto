@@ -213,11 +213,31 @@ message IcebergScanCommon {
 }
 
 message IcebergScan {
-  // Common data shared across partitions (pools, metadata, catalog props)
+  // Common data shared across partitions (pools, metadata, catalog props).
+  //
+  // Delivery is one of two mutually exclusive modes:
+  //   - Inline (small scans, the default and legacy path): `common` is set and
+  //     `common_ref` is empty. The pools travel embedded in this operator, exactly
+  //     as before.
+  //   - Out-of-band (large scans): `common` is UNSET and `common_ref` carries the
+  //     table's metadata_location. The pools are delivered separately -- sharded into
+  //     multiple IcebergScanCommon chunks, each well under protobuf's 2 GiB message
+  //     ceiling -- and registered once per executor process via
+  //     Native.registerIcebergCommon before this plan is created. The planner resolves
+  //     the merged, cached common by this key. This path exists because a scan over an
+  //     Iceberg MOR table with many distinct positional-delete-file combinations can
+  //     produce a delete_files_pool (and other pools) whose combined serialized size
+  //     exceeds what a single protobuf message / single Java byte[] can represent
+  //     (Integer.MAX_VALUE), which previously threw NegativeArraySizeException from
+  //     AbstractMessageLite.toByteArray (see issue #4944).
   IcebergScanCommon common = 1;
 
   // Single partition's file scan tasks
   repeated IcebergFileScanTask file_scan_tasks = 2;
+
+  // Reference key (table metadata_location) into the per-executor registered-common
+  // cache. Non-empty iff `common` is unset (out-of-band mode). See `common` above.
+  string common_ref = 3;
 }
 
 // Helper message for deduplicating field ID lists
